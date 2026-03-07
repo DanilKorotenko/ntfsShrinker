@@ -1,20 +1,19 @@
 using System.Diagnostics;
 using System.Globalization;
-using System.Text.RegularExpressions;
 using System.Text.Json;
 
 const string Usage = """
 Usage:
-  ntfsShrinker shrink <device> <bytesToShrink>
-  ntfsShrinker reset <device>
-  ntfsShrinker current-size <device>
-  ntfsShrinker original-size <device>
+  ntfsShrinker shrink <volume> <bytesToShrink>
+  ntfsShrinker reset <volume>
+  ntfsShrinker current-size <volume>
+  ntfsShrinker original-size <volume>
 
 Examples:
-  ntfsShrinker shrink /dev/sdb1 1048576
-  ntfsShrinker reset /dev/sdb1
-  ntfsShrinker current-size /dev/sdb1
-  ntfsShrinker original-size /dev/sdb1
+  ntfsShrinker shrink C 1048576
+  ntfsShrinker reset C:
+  ntfsShrinker current-size D
+  ntfsShrinker original-size D:
 """;
 
 var stateStore = new SizeStateStore();
@@ -50,18 +49,18 @@ static int Shrink(string[] args, SizeStateStore stateStore)
         return Fail("Invalid arguments for shrink.");
     }
 
-    var device = NormalizeDevicePath(args[1]);
+    var volume = NormalizeVolume(args[1]);
     if (!long.TryParse(args[2], out var bytesToShrink) || bytesToShrink <= 0)
     {
         return Fail("bytesToShrink must be a positive integer.");
     }
 
-    var currentSize = NtfsVolumeService.GetCurrentSizeBytes(device);
-    var originalSize = stateStore.GetOriginalSize(device);
+    var currentSize = NtfsVolumeService.GetCurrentSizeBytes(volume);
+    var originalSize = stateStore.GetOriginalSize(volume);
 
     if (originalSize is null)
     {
-        stateStore.SetOriginalSize(device, currentSize);
+        stateStore.SetOriginalSize(volume, currentSize);
         originalSize = currentSize;
     }
 
@@ -71,10 +70,11 @@ static int Shrink(string[] args, SizeStateStore stateStore)
     }
 
     var targetSize = currentSize - bytesToShrink;
-    NtfsVolumeService.Resize(device, targetSize);
+    NtfsVolumeService.Resize(volume, targetSize);
+    var resizedSize = NtfsVolumeService.GetCurrentSizeBytes(volume);
 
     Console.WriteLine($"original-size={originalSize}");
-    Console.WriteLine($"current-size={targetSize}");
+    Console.WriteLine($"current-size={resizedSize}");
     return 0;
 }
 
@@ -85,17 +85,18 @@ static int Reset(string[] args, SizeStateStore stateStore)
         return Fail("Invalid arguments for reset.");
     }
 
-    var device = NormalizeDevicePath(args[1]);
-    var originalSize = stateStore.GetOriginalSize(device);
+    var volume = NormalizeVolume(args[1]);
+    var originalSize = stateStore.GetOriginalSize(volume);
     if (originalSize is null)
     {
-        return Fail($"No original size recorded for device: {device}");
+        return Fail($"No original size recorded for volume: {volume}");
     }
 
-    NtfsVolumeService.Resize(device, originalSize.Value);
+    NtfsVolumeService.Resize(volume, originalSize.Value);
+    var resizedSize = NtfsVolumeService.GetCurrentSizeBytes(volume);
 
     Console.WriteLine($"original-size={originalSize.Value}");
-    Console.WriteLine($"current-size={originalSize.Value}");
+    Console.WriteLine($"current-size={resizedSize}");
     return 0;
 }
 
@@ -106,8 +107,8 @@ static int PrintCurrentSize(string[] args)
         return Fail("Invalid arguments for current-size.");
     }
 
-    var device = NormalizeDevicePath(args[1]);
-    var currentSize = NtfsVolumeService.GetCurrentSizeBytes(device);
+    var volume = NormalizeVolume(args[1]);
+    var currentSize = NtfsVolumeService.GetCurrentSizeBytes(volume);
     Console.WriteLine(currentSize);
     return 0;
 }
@@ -119,25 +120,36 @@ static int PrintOriginalSize(string[] args, SizeStateStore stateStore)
         return Fail("Invalid arguments for original-size.");
     }
 
-    var device = NormalizeDevicePath(args[1]);
-    var originalSize = stateStore.GetOriginalSize(device);
+    var volume = NormalizeVolume(args[1]);
+    var originalSize = stateStore.GetOriginalSize(volume);
     if (originalSize is null)
     {
-        return Fail($"No original size recorded for device: {device}");
+        return Fail($"No original size recorded for volume: {volume}");
     }
 
     Console.WriteLine(originalSize.Value);
     return 0;
 }
 
-static string NormalizeDevicePath(string rawDevice)
+static string NormalizeVolume(string rawVolume)
 {
-    if (string.IsNullOrWhiteSpace(rawDevice))
+    if (string.IsNullOrWhiteSpace(rawVolume))
     {
-        throw new ArgumentException("Device path cannot be empty.");
+        throw new ArgumentException("Volume cannot be empty.");
     }
 
-    return rawDevice.Trim();
+    var value = rawVolume.Trim().TrimEnd('\\', '/');
+    if (value.Length == 1 && char.IsLetter(value[0]))
+    {
+        return char.ToUpperInvariant(value[0]).ToString();
+    }
+
+    if (value.Length == 2 && char.IsLetter(value[0]) && value[1] == ':')
+    {
+        return char.ToUpperInvariant(value[0]).ToString();
+    }
+
+    throw new ArgumentException("Volume must be a drive letter like C or C:.");
 }
 
 static int PrintUsage()
@@ -155,51 +167,80 @@ static int Fail(string message)
 
 internal sealed class NtfsVolumeService
 {
-    public static long GetCurrentSizeBytes(string device)
+    public static long GetCurrentSizeBytes(string volume)
     {
-        var output = RunProcess("ntfsresize", "--info", "--force", device);
-        var match = Regex.Match(
-            output,
-            @"Current volume size:\s*(\d+)\s+bytes",
-            RegexOptions.IgnoreCase | RegexOptions.Multiline);
+        EnsureWindowsPlatform();
+        EnsureNtfs(volume);
 
-        if (!match.Success || !long.TryParse(match.Groups[1].Value, out var bytes) || bytes <= 0)
+        var output = RunPowerShell(
+            $"$p = Get-Partition -DriveLetter '{volume}' -ErrorAction Stop; [Console]::Out.Write($p.Size)");
+        if (!long.TryParse(output, out var bytes) || bytes <= 0)
         {
             throw new InvalidOperationException(
-                $"Failed to parse NTFS current volume size from output:{Environment.NewLine}{output}");
+                $"Failed to parse current size for volume {volume}. Output: {output}");
         }
 
         return bytes;
     }
 
-    public static void Resize(string device, long targetSizeBytes)
+    public static void Resize(string volume, long targetSizeBytes)
     {
         if (targetSizeBytes <= 0)
         {
             throw new ArgumentOutOfRangeException(nameof(targetSizeBytes), "Target size must be positive.");
         }
 
-        var output = RunProcess(
-            "ntfsresize",
-            "--force",
-            "--size",
-            targetSizeBytes.ToString(CultureInfo.InvariantCulture),
-            device);
-        if (!string.IsNullOrWhiteSpace(output))
+        EnsureWindowsPlatform();
+        EnsureNtfs(volume);
+        RunPowerShell(
+            $"Resize-Partition -DriveLetter '{volume}' -Size {targetSizeBytes.ToString(CultureInfo.InvariantCulture)} -ErrorAction Stop | Out-Null");
+    }
+
+    private static void EnsureWindowsPlatform()
+    {
+        if (!OperatingSystem.IsWindows())
         {
-            Console.WriteLine(output);
+            throw new PlatformNotSupportedException(
+                "This utility is intended to run on Windows 10+.");
         }
+    }
+
+    private static void EnsureNtfs(string volume)
+    {
+        var fs = RunPowerShell(
+            $"$v = Get-Volume -DriveLetter '{volume}' -ErrorAction Stop; [Console]::Out.Write($v.FileSystem)");
+
+        if (!string.Equals(fs, "NTFS", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"Volume {volume} is not NTFS (detected: {fs}).");
+        }
+    }
+
+    private static string RunPowerShell(string script)
+    {
+        return RunProcess(
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script);
     }
 
     private static string RunProcess(string fileName, params string[] arguments)
     {
-        using var process = new Process();
-        process.StartInfo = new ProcessStartInfo
+        using var process = new Process
         {
-            FileName = fileName,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = fileName,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            }
         };
         foreach (var arg in arguments)
         {
@@ -209,24 +250,27 @@ internal sealed class NtfsVolumeService
         try
         {
             process.Start();
+            var stdout = process.StandardOutput.ReadToEnd();
+            var stderr = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+
+            if (process.ExitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    $"Command '{fileName} {string.Join(' ', arguments)}' failed with exit code {process.ExitCode}:{Environment.NewLine}{stderr}");
+            }
+
+            return stdout.Trim();
+        }
+        catch (InvalidOperationException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
             throw new InvalidOperationException(
-                $"Failed to start command '{fileName}'. Ensure it is installed and in PATH.", ex);
+                $"Failed to run command '{fileName}'. Ensure required Windows tools are available.", ex);
         }
-
-        var stdout = process.StandardOutput.ReadToEnd();
-        var stderr = process.StandardError.ReadToEnd();
-        process.WaitForExit();
-
-        if (process.ExitCode != 0)
-        {
-            throw new InvalidOperationException(
-                $"Command '{fileName} {string.Join(' ', arguments)}' failed with exit code {process.ExitCode}:{Environment.NewLine}{stderr}");
-        }
-
-        return $"{stdout}{Environment.NewLine}{stderr}".Trim();
     }
 }
 
@@ -245,21 +289,21 @@ internal sealed class SizeStateStore
         _stateFilePath = Path.Combine(stateDirectory, "state.json");
     }
 
-    public long? GetOriginalSize(string device)
+    public long? GetOriginalSize(string volume)
     {
         lock (_sync)
         {
             var state = ReadState();
-            return state.TryGetValue(device, out var size) ? size : null;
+            return state.TryGetValue(volume, out var size) ? size : null;
         }
     }
 
-    public void SetOriginalSize(string device, long sizeBytes)
+    public void SetOriginalSize(string volume, long sizeBytes)
     {
         lock (_sync)
         {
             var state = ReadState();
-            state[device] = sizeBytes;
+            state[volume] = sizeBytes;
             WriteState(state);
         }
     }
@@ -268,17 +312,19 @@ internal sealed class SizeStateStore
     {
         if (!File.Exists(_stateFilePath))
         {
-            return new Dictionary<string, long>(StringComparer.Ordinal);
+            return new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
         }
 
         var rawJson = File.ReadAllText(_stateFilePath);
         if (string.IsNullOrWhiteSpace(rawJson))
         {
-            return new Dictionary<string, long>(StringComparer.Ordinal);
+            return new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
         }
 
         var state = JsonSerializer.Deserialize<Dictionary<string, long>>(rawJson);
-        return state ?? new Dictionary<string, long>(StringComparer.Ordinal);
+        return state is null
+            ? new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, long>(state, StringComparer.OrdinalIgnoreCase);
     }
 
     private void WriteState(Dictionary<string, long> state)

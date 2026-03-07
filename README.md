@@ -1,6 +1,6 @@
 # ntfsShrinker
 
-Command-line utility for NTFS volume size management.
+Command-line utility for NTFS volume size management on Windows 10+.
 
 ## Features
 
@@ -11,29 +11,32 @@ Command-line utility for NTFS volume size management.
 
 ## Requirements
 
-- Linux with `ntfsresize` installed and available in `PATH`.
-- Permissions required to resize block devices (typically root).
+- Windows 10 or newer.
+- PowerShell with Storage cmdlets (`Get-Partition`, `Resize-Partition`, `Get-Volume`).
+- Administrator privileges.
+- .NET 8 SDK/runtime.
 
 ## Usage
 
 ```bash
-dotnet run -- shrink <device> <bytesToShrink>
-dotnet run -- reset <device>
-dotnet run -- current-size <device>
-dotnet run -- original-size <device>
+dotnet run -- shrink <volume> <bytesToShrink>
+dotnet run -- reset <volume>
+dotnet run -- current-size <volume>
+dotnet run -- original-size <volume>
 ```
 
 Examples:
 
 ```bash
-dotnet run -- shrink /dev/sdb1 1048576
-dotnet run -- reset /dev/sdb1
-dotnet run -- current-size /dev/sdb1
-dotnet run -- original-size /dev/sdb1
+dotnet run -- shrink C 1048576
+dotnet run -- reset C:
+dotnet run -- current-size D
+dotnet run -- original-size D:
 ```
 
 ## Notes
 
-- The first time you run `shrink` for a device, the current size is saved as that device's "original size".
+- The first time you run `shrink` for a volume, the current size is saved as that volume's "original size".
 - Original sizes are stored in:
-  - `~/.local/share/ntfsShrinker/state.json` (via `LocalApplicationData` on Linux).
+  - `%LOCALAPPDATA%\ntfsShrinker\state.json`.
+- `<volume>` must be a drive letter such as `C` or `C:`.
