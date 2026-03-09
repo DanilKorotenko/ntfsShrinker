@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "ntfsShrinker": {
+      "commandName": "Project",
+      "commandLineArgs": "info --drive D:"
+    },
+    "ntfsShrinker shrink": {
+      "commandName": "Project",
+      "commandLineArgs": "shrink --drive D --mb 1"
+    }
+  }
+}
