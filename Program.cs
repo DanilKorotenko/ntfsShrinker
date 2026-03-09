@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 const string Usage = """
 Usage:
@@ -167,20 +168,21 @@ static int Fail(string message)
 
 internal sealed class NtfsVolumeService
 {
+    private const long BytesPerMiB = 1024 * 1024;
+    private static readonly Regex DiskPartErrorRegex = new(
+        "(?im)(DiskPart has encountered an error|Virtual Disk Service error|The arguments specified for this command are not valid|There is no volume selected)",
+        RegexOptions.Compiled);
+
     public static long GetCurrentSizeBytes(string volume)
     {
         EnsureWindowsPlatform();
-        EnsureNtfs(volume);
-
-        var output = RunPowerShell(
-            $"$p = Get-Partition -DriveLetter '{volume}' -ErrorAction Stop; [Console]::Out.Write($p.Size)");
-        if (!long.TryParse(output, out var bytes) || bytes <= 0)
+        var info = GetVolumeInfo(volume);
+        if (!string.Equals(info.FileSystem, "NTFS", StringComparison.OrdinalIgnoreCase))
         {
-            throw new InvalidOperationException(
-                $"Failed to parse current size for volume {volume}. Output: {output}");
+            throw new InvalidOperationException($"Volume {volume} is not NTFS (detected: {info.FileSystem}).");
         }
 
-        return bytes;
+        return info.SizeBytes;
     }
 
     public static void Resize(string volume, long targetSizeBytes)
@@ -191,9 +193,33 @@ internal sealed class NtfsVolumeService
         }
 
         EnsureWindowsPlatform();
-        EnsureNtfs(volume);
-        RunPowerShell(
-            $"Resize-Partition -DriveLetter '{volume}' -Size {targetSizeBytes.ToString(CultureInfo.InvariantCulture)} -ErrorAction Stop | Out-Null");
+        var info = GetVolumeInfo(volume);
+        if (!string.Equals(info.FileSystem, "NTFS", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException($"Volume {volume} is not NTFS (detected: {info.FileSystem}).");
+        }
+
+        if (targetSizeBytes == info.SizeBytes)
+        {
+            return;
+        }
+
+        if (targetSizeBytes < info.SizeBytes)
+        {
+            var shrinkBytes = info.SizeBytes - targetSizeBytes;
+            var shrinkMiB = ToDiskPartMiB(shrinkBytes);
+            RunDiskPart(
+                $"select volume {volume}",
+                $"shrink desired={shrinkMiB.ToString(CultureInfo.InvariantCulture)}");
+        }
+        else
+        {
+            var extendBytes = targetSizeBytes - info.SizeBytes;
+            var extendMiB = ToDiskPartMiB(extendBytes);
+            RunDiskPart(
+                $"select volume {volume}",
+                $"extend size={extendMiB.ToString(CultureInfo.InvariantCulture)}");
+        }
     }
 
     private static void EnsureWindowsPlatform()
@@ -205,28 +231,144 @@ internal sealed class NtfsVolumeService
         }
     }
 
-    private static void EnsureNtfs(string volume)
+    private static long ToDiskPartMiB(long bytes)
     {
-        var fs = RunPowerShell(
-            $"$v = Get-Volume -DriveLetter '{volume}' -ErrorAction Stop; [Console]::Out.Write($v.FileSystem)");
+        if (bytes <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(bytes), "Resize amount must be positive.");
+        }
 
-        if (!string.Equals(fs, "NTFS", StringComparison.OrdinalIgnoreCase))
+        if (bytes % BytesPerMiB != 0)
         {
             throw new InvalidOperationException(
-                $"Volume {volume} is not NTFS (detected: {fs}).");
+                $"DiskPart resize granularity is 1 MiB. Requested amount {bytes} bytes must be divisible by {BytesPerMiB}.");
         }
+
+        return bytes / BytesPerMiB;
     }
 
-    private static string RunPowerShell(string script)
+    private static VolumeInfo GetVolumeInfo(string volume)
     {
-        return RunProcess(
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script);
+        var output = RunDiskPart(
+            "list volume",
+            $"select volume {volume}",
+            "detail volume");
+
+        var fileSystem = ParseFileSystem(output, volume);
+        var sizeBytes = ParseSizeBytes(output, volume);
+        return new VolumeInfo(fileSystem, sizeBytes);
+    }
+
+    private static string ParseFileSystem(string output, string volume)
+    {
+        var detailMatch = Regex.Match(
+            output,
+            @"(?im)^\s*File System\s*:\s*(?<fs>\S+)\s*$");
+        if (detailMatch.Success)
+        {
+            return detailMatch.Groups["fs"].Value.Trim();
+        }
+
+        var listLineMatch = Regex.Match(
+            output,
+            $@"(?im)^\s*Volume\s+\d+\s+{Regex.Escape(volume)}\s+.*?\s+(?<fs>[A-Za-z0-9]+)\s+\S+\s+[\d\.,]+\s*(B|KB|MB|GB|TB)\b");
+        if (listLineMatch.Success)
+        {
+            return listLineMatch.Groups["fs"].Value.Trim();
+        }
+
+        throw new InvalidOperationException(
+            $"Failed to determine filesystem for volume {volume} from DiskPart output:{Environment.NewLine}{output}");
+    }
+
+    private static long ParseSizeBytes(string output, string volume)
+    {
+        var detailCapacityMatch = Regex.Match(
+            output,
+            @"(?im)^\s*Volume Capacity\s*:\s*(?<size>[\d\.,]+)\s*(?<unit>B|KB|MB|GB|TB)\b");
+        if (detailCapacityMatch.Success)
+        {
+            return ConvertToBytes(detailCapacityMatch.Groups["size"].Value, detailCapacityMatch.Groups["unit"].Value);
+        }
+
+        var detailSizeMatch = Regex.Match(
+            output,
+            @"(?im)^\s*Size\s*:\s*(?<size>[\d\.,]+)\s*(?<unit>B|KB|MB|GB|TB)\b");
+        if (detailSizeMatch.Success)
+        {
+            return ConvertToBytes(detailSizeMatch.Groups["size"].Value, detailSizeMatch.Groups["unit"].Value);
+        }
+
+        var listLineMatch = Regex.Match(
+            output,
+            $@"(?im)^\s*Volume\s+\d+\s+{Regex.Escape(volume)}\s+.*?\s+(?<fs>[A-Za-z0-9]+)\s+\S+\s+(?<size>[\d\.,]+)\s*(?<unit>B|KB|MB|GB|TB)\b");
+        if (listLineMatch.Success)
+        {
+            return ConvertToBytes(listLineMatch.Groups["size"].Value, listLineMatch.Groups["unit"].Value);
+        }
+
+        throw new InvalidOperationException(
+            $"Failed to determine size for volume {volume} from DiskPart output:{Environment.NewLine}{output}");
+    }
+
+    private static long ConvertToBytes(string rawSize, string rawUnit)
+    {
+        var normalized = rawSize.Trim().Replace(" ", string.Empty);
+
+        if (normalized.Contains(',') && normalized.Contains('.'))
+        {
+            normalized = normalized.Replace(",", string.Empty);
+        }
+        else if (normalized.Contains(','))
+        {
+            normalized = normalized.Replace(',', '.');
+        }
+
+        if (!decimal.TryParse(
+                normalized,
+                NumberStyles.AllowLeadingSign | NumberStyles.AllowDecimalPoint,
+                CultureInfo.InvariantCulture,
+                out var number) || number <= 0)
+        {
+            throw new InvalidOperationException($"Failed to parse DiskPart size number: {rawSize}");
+        }
+
+        long multiplier = rawUnit.ToUpperInvariant() switch
+        {
+            "B" => 1L,
+            "KB" => 1024L,
+            "MB" => 1024L * 1024L,
+            "GB" => 1024L * 1024L * 1024L,
+            "TB" => 1024L * 1024L * 1024L * 1024L,
+            _ => throw new InvalidOperationException($"Unsupported DiskPart unit: {rawUnit}")
+        };
+
+        return checked((long)Math.Round(number * multiplier, MidpointRounding.AwayFromZero));
+    }
+
+    private static string RunDiskPart(params string[] commands)
+    {
+        var scriptPath = Path.Combine(Path.GetTempPath(), $"ntfsShrinker-{Guid.NewGuid():N}.txt");
+        File.WriteAllLines(scriptPath, commands);
+
+        try
+        {
+            return RunProcess("diskpart.exe", "/s", scriptPath);
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(scriptPath))
+                {
+                    File.Delete(scriptPath);
+                }
+            }
+            catch
+            {
+                // best effort cleanup
+            }
+        }
     }
 
     private static string RunProcess(string fileName, params string[] arguments)
@@ -260,7 +402,14 @@ internal sealed class NtfsVolumeService
                     $"Command '{fileName} {string.Join(' ', arguments)}' failed with exit code {process.ExitCode}:{Environment.NewLine}{stderr}");
             }
 
-            return stdout.Trim();
+            var output = $"{stdout}{Environment.NewLine}{stderr}".Trim();
+            if (DiskPartErrorRegex.IsMatch(output))
+            {
+                throw new InvalidOperationException(
+                    $"Command '{fileName} {string.Join(' ', arguments)}' reported an error:{Environment.NewLine}{output}");
+            }
+
+            return output;
         }
         catch (InvalidOperationException)
         {
@@ -272,6 +421,8 @@ internal sealed class NtfsVolumeService
                 $"Failed to run command '{fileName}'. Ensure required Windows tools are available.", ex);
         }
     }
+
+    private readonly record struct VolumeInfo(string FileSystem, long SizeBytes);
 }
 
 internal sealed class SizeStateStore

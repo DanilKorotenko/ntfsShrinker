@@ -12,7 +12,7 @@ Command-line utility for NTFS volume size management on Windows 10+.
 ## Requirements
 
 - Windows 10 or newer.
-- PowerShell with Storage cmdlets (`Get-Partition`, `Resize-Partition`, `Get-Volume`).
+- `diskpart.exe` available (standard on Windows).
 - Administrator privileges.
 - .NET 8 SDK/runtime.
 
@@ -40,3 +40,4 @@ dotnet run -- original-size D:
 - Original sizes are stored in:
   - `%LOCALAPPDATA%\ntfsShrinker\state.json`.
 - `<volume>` must be a drive letter such as `C` or `C:`.
+- The resize amount passed to `shrink` must be divisible by `1048576` (1 MiB), because DiskPart resizes in MiB units.
